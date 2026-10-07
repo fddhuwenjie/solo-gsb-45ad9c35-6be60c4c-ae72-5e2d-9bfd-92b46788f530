@@ -33,6 +33,19 @@ occupied=false 同时 isolated=true。
 查询中显示需追溯（trace_required）及受影响的组号、电芯 ID 和原因。批次列表与按号
 查询同时呈现历史发运事实与当前隔离状态，单次响应来自同一已提交快照；重复发运明确
 拒绝（409），未发运批次继续按原规则查询。
+
+撤销：允许撤销尚未发运的交付批次，把仍安全的成员组释放出来重新编批。撤销按批次号
+提交非空原因：批次不存在返回 404，已发运或已撤销返回 409，检查不通过即整体回滚，
+失败不释放任何成员。成功后在同一事务内写入不可改写的撤销时间与原因（触发器禁止
+UPDATE/DELETE）并删除成员组的当前占用；原批次头、成员关系与各组检测快照原样保留，
+批次列表和详情继续可查并显示撤销状态。撤销批次不可交付（deliverable=false）、
+不可发运（发运重查撤销状态，命中即 409）。
+
+组占用与"未撤销"口径：建批时只有未撤销批次占用组（当前占用登记在 batch_group_holds，
+每组至多一行）；撤销提交后占用行删除，新建批次才能复用该组。已隔离的组仍按原规则
+拒绝入批，即使其所属批次已撤销。撤销与发运走同一写路径，以提交先后决定：撤销先
+提交则发运拒绝，发运先提交则撤销拒绝。建批与撤销交错时，同一组不得同时归属两个
+未撤销批次：后提交的事务在占用表上冲突即整体回滚，冲突操作不会留下部分生效的记录。
 """
 from datetime import datetime, timezone
 
@@ -41,12 +54,12 @@ from fastapi.responses import JSONResponse
 
 from . import db
 from .schemas import (
-    BatchCreate, CellCreate, ConfirmRequest, IsolateRequest, PreselectRequest,
-    TestRevision,
+    BatchCancelRequest, BatchCreate, CellCreate, ConfirmRequest, IsolateRequest,
+    PreselectRequest, TestRevision,
 )
 from .selection import choose_group
 
-app = FastAPI(title="退役电芯成组放行 API", version="1.3.0")
+app = FastAPI(title="退役电芯成组放行 API", version="1.4.0")
 
 
 # 一次取出电芯档案与隔离标志：LEFT JOIN 单条语句天然共享同一读快照，
@@ -439,9 +452,13 @@ def get_group(group_id: int):
 def create_batch(body: BatchCreate):
     """登记交付批次：单事务内重查全部成员组，全部通过才登记独占归属。
 
-    仅接收同一化学体系、当前未被隔离阻断且尚未归属其他批次的组；有组不存在、
-    已阻断或被另一批次先行占用 -> 整批拒绝、回滚，不产生批次也不留部分归属。
-    与隔离共用同一写路径：并发时以提交先后决定是拒绝建批还是让已建批次转为阻断。
+    仅接收同一化学体系、当前未被隔离阻断且尚未归属其他**未撤销**批次的组；
+    有组不存在、已阻断或被另一未撤销批次先行占用 -> 整批拒绝、回滚，不产生批次
+    也不留部分归属。已撤销批次的成员关系仍在 batch_groups 中，但不再占用组，
+    因此其组可以重新入批；占用以 batch_group_holds 为准（group_id 主键兜底，
+    同一组不可能同时归属两个未撤销批次）。
+    与隔离/撤销共用同一写路径：并发时以提交先后决定是拒绝建批、让已建批次
+    转为阻断，还是撞上先提交的撤销复用。
     """
     ids = body.group_ids
     if len(set(ids)) != len(ids):
@@ -460,14 +477,14 @@ def create_batch(body: BatchCreate):
             if missing:
                 raise HTTPException(409, f"组不存在，整批拒绝：{missing}")
             taken = conn.execute(
-                f"SELECT group_id, batch_id FROM batch_groups"
+                f"SELECT group_id, batch_id FROM batch_group_holds"
                 f" WHERE group_id IN ({','.join('?' * len(ids))}) ORDER BY group_id",
                 ids,
             ).fetchall()
             if taken:
                 raise HTTPException(
                     409,
-                    "组已归属其他批次，整批拒绝："
+                    "组已归属其他未撤销批次，整批拒绝："
                     + str([{r["group_id"]: r["batch_id"]} for r in taken]))
             blocked = conn.execute(
                 f"SELECT DISTINCT gc.group_id FROM group_cells gc"
@@ -496,6 +513,11 @@ def create_batch(body: BatchCreate):
                 conn.execute(
                     "INSERT INTO batch_groups (batch_id, group_id) VALUES (?, ?)",
                     (batch_id, i),
+                )
+                # 仅未撤销批次占用组；撤销时删除此行，组才可重新编批
+                conn.execute(
+                    "INSERT INTO batch_group_holds (group_id, batch_id) VALUES (?, ?)",
+                    (i, batch_id),
                 )
             conn.commit()
         except Exception:
@@ -529,12 +551,21 @@ def _batch_payload(conn, batch_id: int) -> dict:
         "SELECT shipped_at FROM shipments WHERE batch_id = ?", (batch_id,),
     ).fetchone()
     shipped_at = ship["shipped_at"] if ship else None
+    # 撤销事实（不可改写）：撤销时间与原因写入后不再变化
+    cancel = conn.execute(
+        "SELECT reason, cancelled_at FROM batch_cancellations WHERE batch_id = ?",
+        (batch_id,),
+    ).fetchone()
+    cancelled = cancel is not None
+    cancelled_at = cancel["cancelled_at"] if cancel else None
+    cancel_reason = cancel["reason"] if cancel else None
     return {
         "batch_id": b["batch_id"],
         "chemistry": b["chemistry"],
         "created_at": b["created_at"],
         "group_ids": group_ids,  # 建批时登记的成员关系，之后固定不变
-        "deliverable": len(blocked_rows) == 0,  # False=整批阻断不可交付
+        # False=整批不可交付：成员被隔离阻断，或批次本身已撤销
+        "deliverable": len(blocked_rows) == 0 and not cancelled,
         "blocked_groups": [
             {"group_id": r["group_id"], "cell_id": r["cell_id"],
              "reason": r["reason"], "isolated_at": r["created_at"]}
@@ -544,6 +575,11 @@ def _batch_payload(conn, batch_id: int) -> dict:
         # 发运事实（不可改写）：未发运批次 shipped=False、shipped_at=None，按原规则查询
         "shipped": shipped_at is not None,
         "shipped_at": shipped_at,
+        # 撤销状态（不可改写）：未撤销批次 cancelled=False、两字段为 null；
+        # 撤销批次仍可查，但不可交付、不可发运
+        "cancelled": cancelled,
+        "cancelled_at": cancelled_at,
+        "cancel_reason": cancel_reason,
         # 已发运且当前有成员被隔离 -> 需追溯，受影响的组号/电芯/原因见 blocked_groups
         "trace_required": shipped_at is not None and len(blocked_rows) > 0,
     }
@@ -567,7 +603,7 @@ def list_batches():
 @app.get("/batches/{batch_id}")
 def get_batch(batch_id: int):
     """按批次号查询：固定成员关系、各组确认时的检测快照、按当前隔离记录判定的
-    整批可交付状态与历史发运事实（未提交或已回滚的批次不可见；
+    整批可交付状态、撤销状态与历史发运事实（未提交或已回滚的批次不可见；
     单次查询只反映同一已提交状态）。"""
     conn = db.get_conn()
     with db.read_snapshot(conn):
@@ -578,17 +614,20 @@ def get_batch(batch_id: int):
         return _batch_payload(conn, batch_id)
 
 
-# ---------- 发运 ----------
+# ---------- 撤销 ----------
 
-@app.post("/batches/{batch_id}/ship", status_code=201)
-def ship_batch(batch_id: int):
-    """按批次号确认发运：单事务内重查批次存在、尚未发运且全部成员当前未被隔离。
+@app.post("/batches/{batch_id}/cancel", status_code=201)
+def cancel_batch(batch_id: int, body: BatchCancelRequest):
+    """撤销未发运的交付批次，释放仍安全的成员组供重新编批。
 
-    任一条件不满足即拒绝、回滚，不留发运记录：批次不存在 -> 404；已发运 -> 409
-    （重复发运明确拒绝）；有成员组当前被隔离阻断 -> 409。成功后写入不可改写的
-    发运时间与批次关联，返回批次号、成员组号和各组原检测快照。
-    与隔离共用同一写路径：并发时以提交先后决定是拒绝发运（隔离先提交）还是
-    保留发运记录（发运先提交，此后隔离在批次查询中显示为需追溯）。
+    单事务内重查：批次存在（否则 404）、尚未发运（否则 409；发运先提交则撤销
+    拒绝）、尚未撤销（否则 409，撤销不可重复）。任一条件不满足即回滚，失败
+    不释放任何成员。成功后写入不可改写的撤销时间与原因，并在同一事务内删除
+    成员组的当前占用（batch_group_holds）；原批次头、成员关系（batch_groups）
+    与各组检测快照原样保留、继续可查，批次显示撤销状态，此后不可交付、不可发运。
+    已隔离的组不因撤销变为安全：重新建批时仍按原隔离规则拒绝。
+    与发运/建批共用同一写路径，以提交先后决定结果；撤销事务未提交前，其他
+    请求看到的仍是占用未释放的旧状态，冲突操作不可能留下部分生效的记录。
     """
     conn = db.get_conn()
     with db.write_lock:
@@ -598,6 +637,68 @@ def ship_batch(batch_id: int):
                 "SELECT 1 FROM batches WHERE batch_id = ?", (batch_id,)).fetchone()
             if b is None:
                 raise HTTPException(404, f"批次 {batch_id} 不存在")
+            shipped = conn.execute(
+                "SELECT shipped_at FROM shipments WHERE batch_id = ?",
+                (batch_id,)).fetchone()
+            if shipped is not None:
+                raise HTTPException(
+                    409, f"批次 {batch_id} 已发运（发运时间 "
+                         f"{shipped['shipped_at']}），不可撤销")
+            existing = conn.execute(
+                "SELECT cancelled_at FROM batch_cancellations WHERE batch_id = ?",
+                (batch_id,)).fetchone()
+            if existing is not None:
+                raise HTTPException(
+                    409, f"批次 {batch_id} 已撤销（撤销时间 "
+                         f"{existing['cancelled_at']}），不可重复撤销")
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "INSERT INTO batch_cancellations (batch_id, reason, cancelled_at)"
+                " VALUES (?, ?, ?)",
+                (batch_id, body.reason, now),
+            )
+            # 释放成员组当前占用：成员关系本身保留在 batch_groups 不可改写，
+            # 仅删除占用登记，之后新建批次才能复用这些组
+            conn.execute(
+                "DELETE FROM batch_group_holds WHERE batch_id = ?", (batch_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()  # 撤销失败：占用与归属保持原状，不释放任何成员
+            raise
+    with db.read_snapshot(conn):
+        return _batch_payload(conn, batch_id)
+
+
+# ---------- 发运 ----------
+
+@app.post("/batches/{batch_id}/ship", status_code=201)
+def ship_batch(batch_id: int):
+    """按批次号确认发运：单事务内重查批次存在、尚未发运、尚未撤销且全部成员
+    当前未被隔离。
+
+    任一条件不满足即拒绝、回滚，不留发运记录：批次不存在 -> 404；已发运 -> 409
+    （重复发运明确拒绝）；已撤销 -> 409（撤销先提交则发运拒绝，撤销批次不可
+    发运）；有成员组当前被隔离阻断 -> 409。成功后写入不可改写的发运时间与批次
+    关联，返回批次号、成员组号和各组原检测快照。
+    与隔离/撤销共用同一写路径：并发时以提交先后决定是拒绝发运（隔离或撤销先
+    提交）还是保留发运记录（发运先提交，撤销随即拒绝，此后隔离在批次查询中
+    显示为需追溯）。
+    """
+    conn = db.get_conn()
+    with db.write_lock:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            b = conn.execute(
+                "SELECT 1 FROM batches WHERE batch_id = ?", (batch_id,)).fetchone()
+            if b is None:
+                raise HTTPException(404, f"批次 {batch_id} 不存在")
+            cancelled = conn.execute(
+                "SELECT cancelled_at FROM batch_cancellations WHERE batch_id = ?",
+                (batch_id,)).fetchone()
+            if cancelled is not None:
+                raise HTTPException(
+                    409, f"批次 {batch_id} 已撤销（撤销时间 "
+                         f"{cancelled['cancelled_at']}），不可发运")
             shipped = conn.execute(
                 "SELECT shipped_at FROM shipments WHERE batch_id = ?",
                 (batch_id,)).fetchone()

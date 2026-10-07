@@ -45,3 +45,9 @@ class BatchCreate(BaseModel):
     """交付批次登记：提交 2~4 个不重复的已确认组号。"""
 
     group_ids: list[int] = Field(min_length=2, max_length=4)
+
+
+class BatchCancelRequest(BaseModel):
+    """撤销未发运交付批次：提交非空撤销原因，撤销记录不可改写、不可重复撤销。"""
+
+    reason: str = Field(min_length=1, max_length=500, description="撤销原因")

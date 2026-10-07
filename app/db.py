@@ -1,7 +1,8 @@
 """SQLite 存储层：每线程独立连接（WAL 模式）+ 写锁。
 
-- 写路径（录入 / 复测 / 确认 / 隔离 / 建批 / 发运）在 write_lock 内以 BEGIN IMMEDIATE
-  开启单事务，保证整组占用与快照写入、整批归属登记、发运记录的原子性；
+- 写路径（录入 / 复测 / 确认 / 隔离 / 建批 / 发运 / 撤销）在 write_lock 内以
+  BEGIN IMMEDIATE 开启单事务，保证整组占用与快照写入、整批归属登记、发运记录、
+  撤销记录与占用释放的原子性；
 - 每个请求线程使用自己的连接，读请求因此只能看到**已提交**的数据：
   确认事务中途写入的组记录、检测快照与临时占用对其他请求不可见，
   提交成功的瞬间整组一次性可见，回滚的确认对外不留任何痕迹；
@@ -72,15 +73,30 @@ CREATE TABLE IF NOT EXISTS batches (
     created_at TEXT NOT NULL
 );
 
--- 批次成员：建批时登记独占归属，成员关系固定不可改写
+-- 批次成员：建批时登记归属，成员关系固定不可改写（仅作历史事实保留，
+-- 不再直接代表"当前占用"：同一组在原批次撤销后可以重新归属新批次，
+-- 因此组号在本表允许重复；当前是否被未撤销批次占用以 batch_group_holds 为准）
 CREATE TABLE IF NOT EXISTS batch_groups (
     batch_id INTEGER NOT NULL REFERENCES batches(batch_id),
     group_id INTEGER NOT NULL REFERENCES groups(group_id),
     PRIMARY KEY (batch_id, group_id)
 );
 
--- 独占归属：同一组号在全库最多归属一个批次
-CREATE UNIQUE INDEX IF NOT EXISTS idx_batch_groups_group ON batch_groups(group_id);
+-- 当前占用：只有未撤销批次在这里登记，每个组号最多一行（主键兜底）。
+-- 撤销时在同一事务内删除占用行（成员关系仍保留在 batch_groups），新建批次
+-- 才能复用该组；建批与撤销交错时，冲突的第二个事务在此处拿不到行而整体回滚，
+-- 同一组不可能同时归属两个未撤销批次。
+CREATE TABLE IF NOT EXISTS batch_group_holds (
+    group_id INTEGER PRIMARY KEY REFERENCES groups(group_id),
+    batch_id INTEGER NOT NULL REFERENCES batches(batch_id)
+);
+
+-- 撤销记录：每批次最多一条（主键兜底），撤销时间与原因一旦写入不可改写
+CREATE TABLE IF NOT EXISTS batch_cancellations (
+    batch_id    INTEGER PRIMARY KEY REFERENCES batches(batch_id),
+    reason      TEXT NOT NULL,
+    cancelled_at TEXT NOT NULL
+);
 
 CREATE TRIGGER IF NOT EXISTS trg_batches_no_update BEFORE UPDATE ON batches
 BEGIN SELECT RAISE(ABORT, 'batches are immutable'); END;
@@ -90,6 +106,10 @@ CREATE TRIGGER IF NOT EXISTS trg_batch_groups_no_update BEFORE UPDATE ON batch_g
 BEGIN SELECT RAISE(ABORT, 'batch membership is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_batch_groups_no_delete BEFORE DELETE ON batch_groups
 BEGIN SELECT RAISE(ABORT, 'batch membership is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_cancellations_no_update BEFORE UPDATE ON batch_cancellations
+BEGIN SELECT RAISE(ABORT, 'cancellations are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_cancellations_no_delete BEFORE DELETE ON batch_cancellations
+BEGIN SELECT RAISE(ABORT, 'cancellations are immutable'); END;
 
 -- 发运记录：每批次最多一条（主键兜底），发运时间与批次关联一旦写入不可改写
 CREATE TABLE IF NOT EXISTS shipments (
@@ -101,6 +121,19 @@ CREATE TRIGGER IF NOT EXISTS trg_shipments_no_update BEFORE UPDATE ON shipments
 BEGIN SELECT RAISE(ABORT, 'shipments are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_shipments_no_delete BEFORE DELETE ON shipments
 BEGIN SELECT RAISE(ABORT, 'shipments are immutable'); END;
+
+-- 既有库迁移（旧版本只有 batch_groups 上的 group_id 唯一索引）：
+-- 撤销复用要求同一组在原批次撤销后可再次入批，旧索引必须删除；
+-- 随后把所有尚未撤销的存量批次成员回填到占用表（INSERT OR IGNORE，
+-- 主键保证每组只归一个未撤销批次），迁移只在首次初始化时执行一次。
+DROP INDEX IF EXISTS idx_batch_groups_group;
+
+INSERT OR IGNORE INTO batch_group_holds (group_id, batch_id)
+SELECT bg.group_id, bg.batch_id
+FROM batch_groups bg
+WHERE NOT EXISTS (
+    SELECT 1 FROM batch_cancellations c WHERE c.batch_id = bg.batch_id
+);
 """
 
 # 确认/写入路径上的互斥锁，配合 BEGIN IMMEDIATE 保证事务原子性
