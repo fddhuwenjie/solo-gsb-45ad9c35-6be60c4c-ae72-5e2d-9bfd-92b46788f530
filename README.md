@@ -4,7 +4,9 @@
 约束预选最优组合，确认时在单个 SQLite 事务中原子占用整组并保存不可改写的检测快照；
 已确认组可登记为 2~4 组的可追溯交付批次，批次按当前隔离记录判定整批是否可交付；
 交付批次可按批次号确认发运一次，发运时间与批次关联不可改写，发运后新增隔离会让
-已发运批次显示为需追溯。
+已发运批次显示为需追溯。**未发运批次可按批次号提交非空原因撤销**：撤销时间与原因
+不可改写，原批次、成员关系与检测快照全部保留，成员组随即释放、可用于重新编批；
+撤销批次不可交付、不可发运，已发运批次不可撤销。
 
 ## 快速启动
 
@@ -57,25 +59,41 @@ python -m pytest tests/ -q
   交付批次。建批在**一次 SQLite 事务**（`BEGIN IMMEDIATE`）中重查全部成员组：仅接收
   **同一化学体系、当前未被隔离阻断且尚未归属其他批次**的组；有组不存在、已阻断或被
   另一批次先行占用，则**整批拒绝、回滚，不产生批次也不留部分归属**。批次成员关系
-  固定（`batches` / `batch_groups` 由触发器禁止 UPDATE/DELETE），每组在全库最多归属
-  一个批次（唯一约束兜底）。`GET /batches` / `GET /batches/{batch_id}` 返回固定成员
-  关系、各组**确认时的检测快照**，并按**当前隔离记录**给出整批 `deliverable` 与
-  受影响的组号、电芯 ID 和原因（`blocked_groups`）；后续隔离会阻断已建批次
-  （`deliverable: false`），但不改写成员关系与原快照。建批与隔离走同一写路径，
-  并发时以**提交先后**决定是拒绝建批（隔离先提交）还是让已建批次转为阻断
+  固定（`batches` / `batch_groups` 由触发器禁止 UPDATE/DELETE）。建批时**只有未撤销
+  批次占用成员组**：当前占用登记在独立的 `active_batch_groups` 表（`group_id` 主键
+  兜底，同一组全库最多归属一个未撤销批次），`GET /batches` / `GET /batches/{batch_id}`
+  返回固定成员关系、各组**确认时的检测快照**，并按**当前隔离记录**给出整批
+  `deliverable` 与受影响的组号、电芯 ID 和原因（`blocked_groups`）；后续隔离会阻断
+  已建批次（`deliverable: false`），但不改写成员关系与原快照。建批与隔离走同一写
+  路径，并发时以**提交先后**决定是拒绝建批（隔离先提交）还是让已建批次转为阻断
   （建批先提交）；批次查询在同一已提交快照内完成，不会拼出跨快照状态。
 - **发运**：`POST /batches/{batch_id}/ship` 按批次号确认发运一次。发运在
   **一次 SQLite 事务**（`BEGIN IMMEDIATE`）中重查：批次存在（否则 `404`）、
-  尚未发运（否则 `409` 重复发运明确拒绝）、全部成员当前未被隔离（否则 `409`
-  拒绝发运）；任一条件不满足即**拒绝、回滚，不留发运记录**。成功后写入**不可改写**
-  的发运时间与批次关联（`shipments` 表由触发器禁止 UPDATE/DELETE，每批次最多一条
-  发运记录），返回批次号、成员组号和各组原检测快照。发运与隔离走同一写路径，
-  并发时以**提交先后**决定：隔离先提交则拒绝发运；发运先提交则记录保留，此后隔离
-  让已发运批次在 `GET /batches` / `GET /batches/{batch_id}` 中显示
-  `trace_required: true`（需追溯）及受影响的组号、电芯 ID 和原因
-  （`blocked_groups`）。批次列表与按号查询同时呈现历史发运事实（`shipped` /
-  `shipped_at`）与当前隔离状态，单次响应来自同一已提交快照；未发运批次
-  （`shipped: false`、`shipped_at: null`）继续按原规则查询。
+  尚未发运（否则 `409` 重复发运明确拒绝）、尚未撤销（否则 `409` 撤销批次不可发运）、
+  全部成员当前未被隔离（否则 `409` 拒绝发运）；任一条件不满足即**拒绝、回滚，不留
+  发运记录**。成功后写入**不可改写**的发运时间与批次关联（`shipments` 表由触发器
+  禁止 UPDATE/DELETE，每批次最多一条发运记录），返回批次号、成员组号和各组原检测
+  快照。发运与隔离、撤销走同一写路径，并发时以**提交先后**决定：隔离先提交则拒绝
+  发运；发运先提交则记录保留，此后隔离让已发运批次在 `GET /batches` /
+  `GET /batches/{batch_id}` 中显示 `trace_required: true`（需追溯）及受影响的组号、
+  电芯 ID 和原因（`blocked_groups`）。批次列表与按号查询同时呈现历史发运事实
+  （`shipped` / `shipped_at`）、撤销状态与当前隔离状态，单次响应来自同一已提交
+  快照；未发运批次（`shipped: false`、`shipped_at: null`）继续按原规则查询。
+- **撤销**：`POST /batches/{batch_id}/cancel` 按批次号提交**非空原因**（`422`
+  兜底空原因），撤销**未发运**的交付批次。撤销在**一次 SQLite 事务**
+  （`BEGIN IMMEDIATE`）中重查：批次存在（否则 `404`）、尚未撤销（否则 `409`
+  不可重复撤销）、尚未发运（否则 `409` 已发运不可撤销）；任一条件不满足即**拒绝、
+  回滚，不写撤销记录也不释放任何成员**。成功后写入**不可改写**的撤销时间与原因
+  （`cancellations` 表由触发器禁止 UPDATE/DELETE，每批次最多一条），并删除该批在
+  `active_batch_groups` 中的整批占用；**原批次头、`batch_groups` 成员关系与各组
+  检测快照全部保留**。批次列表与详情显示撤销状态（`cancelled` / `cancelled_at` /
+  `cancel_reason`），撤销批次 `deliverable: false`、不可发运。撤销后**只有新建批次
+  才能复用释放的组**：已隔离的组仍按原规则拒绝（即使其所属批次已撤销），仅安全成员
+  可重新编批；`batch_groups` 中同一组会留下两条历史归属（旧撤销批次 + 新批次），
+  而 `active_batch_groups` 中任意时刻只有一行。撤销与发运、建批走同一写路径，以
+  **提交先后**决胜：撤销先提交则发运 `409` 拒绝，发运先提交则撤销 `409` 拒绝；
+  建批与撤销交错时，`active_batch_groups` 的 `group_id` 主键保证同一组不可能同时
+  归属两个未撤销批次，冲突操作**整体回滚、不留部分生效的记录**。
 - **并发可见性**：每个请求使用各自线程的独立 SQLite 连接（WAL 模式），查询只能
   看到**已提交的完整快照**。确认/隔离事务提交前，其他请求看不到其中间状态；提交
   成功的瞬间整组（组记录 + 快照 + 占用）或隔离记录一次性可见，回滚则毫无痕迹。
@@ -102,9 +120,10 @@ python -m pytest tests/ -q
 | POST | `/preselect` | 预选成组（只读，排除已隔离电芯） |
 | POST | `/groups/confirm` | 确认候选（单事务重查版本/占用/隔离，原子占用 + 快照） |
 | GET | `/groups` / `/groups/{group_id}` | 查询已确认组：检测快照 + 当前阻断状态 |
-| POST | `/batches` | 登记交付批次（2~4 个不重复组号；单事务重查，独占归属） |
-| GET | `/batches` / `/batches/{batch_id}` | 查询批次：固定成员 + 各组检测快照 + 整批可交付状态 + 发运事实 |
-| POST | `/batches/{batch_id}/ship` | 按批次号确认发运（一次；单事务重查存在/未发运/未隔离） |
+| POST | `/batches` | 登记交付批次（2~4 个不重复组号；单事务重查，独占未撤销批次归属） |
+| GET | `/batches` / `/batches/{batch_id}` | 查询批次：固定成员 + 各组检测快照 + 可交付/撤销/发运状态 |
+| POST | `/batches/{batch_id}/ship` | 按批次号确认发运（一次；单事务重查存在/未撤销/未发运/未隔离） |
+| POST | `/batches/{batch_id}/cancel` | 撤销未发运批次（非空原因；释放成员占用，批次与快照保留） |
 
 ## 调用示例（curl）
 
@@ -355,6 +374,12 @@ curl -s -X POST http://localhost:8000/batches \
   "group_ids": [1, 2],
   "deliverable": true,
   "blocked_groups": [],
+  "shipped": false,
+  "shipped_at": null,
+  "trace_required": false,
+  "cancelled": false,
+  "cancelled_at": null,
+  "cancel_reason": null,
   "groups": [
     {"group_id": 1, "blocked": false, "blocked_cells": [],
      "cells": [{"cell_id": "C001", "capacity": 100.0, "resistance": 2.1, "test_version": "T1"}]},
@@ -364,7 +389,8 @@ curl -s -X POST http://localhost:8000/batches \
 ```
 
 整批拒绝的情形（`409`，不产生批次也不留部分归属）：组号不存在、组当前被隔离
-阻断、组已归属其他批次、成员组化学体系不一致；组号重复或数量不在 2~4 返回 `422`。
+阻断、组已归属其他**未撤销**批次（已撤销批次的成员组允许复用）、成员组化学体系
+不一致；组号重复或数量不在 2~4 返回 `422`。
 
 ### 10. 查询批次与隔离阻断
 
@@ -437,6 +463,10 @@ curl -s -X POST http://localhost:8000/cells/C005/isolate \
   -H 'Content-Type: application/json' -d '{"reason":"巡检发现鼓包"}'
 curl -s -X POST http://localhost:8000/batches/1/ship
 # {"detail":"批次成员当前被安全隔离阻断，拒绝发运：[{2: 'C005'}]"}
+
+# 批次已撤销 -> 409（撤销批次不可发运）
+curl -s -X POST http://localhost:8000/batches/1/ship
+# {"detail":"批次 1 已撤销（撤销时间 2026-10-07T00:00:00.000000+00:00），不可发运"}
 ```
 
 发运后批次查询同时呈现历史发运事实与当前隔离状态（未发运批次为
@@ -455,6 +485,8 @@ curl -s http://localhost:8000/batches/1
   "shipped": true,
   "shipped_at": "2026-10-06T04:00:00.000000+00:00",
   "trace_required": false,
+  "cancelled": false,
+  "cancel_reason": null,
   "groups": ["...成员关系与各组确认时快照保持不变..."]
 }
 ```
@@ -483,6 +515,8 @@ curl -s http://localhost:8000/batches/1
   "shipped": true,
   "shipped_at": "2026-10-06T04:00:00.000000+00:00",
   "trace_required": true,
+  "cancelled": false,
+  "cancel_reason": null,
   "groups": ["...成员关系与各组确认时快照保持不变..."]
 }
 ```
@@ -492,14 +526,87 @@ curl -s http://localhost:8000/batches/1
 批次查询都在同一已提交快照内完成，`shipped` / `shipped_at` / `trace_required` /
 `deliverable` / `blocked_groups` 必然自洽，不会拼出跨快照状态。
 
+### 13. 撤销未发运批次并重新编批
+
+未发运批次可以按批次号提交**非空原因**撤销。成功后写入不可改写的撤销时间与原因，
+原批次、成员关系与各组检测快照全部保留并继续可查；成员组的当前占用被释放，可用于
+新建批次（已隔离的组仍按原规则拒绝，即使所属批次已撤销）：
+
+```bash
+# 撤销批次 1（未发运）-> 201，返回带撤销状态的批次详情
+curl -s -X POST http://localhost:8000/batches/1/cancel \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"客户订单取消，整批复检前退回"}'
+```
+
+```json
+{
+  "batch_id": 1,
+  "group_ids": [1, 2],
+  "deliverable": false,
+  "blocked_groups": [],
+  "shipped": false,
+  "shipped_at": null,
+  "trace_required": false,
+  "cancelled": true,
+  "cancelled_at": "2026-10-07T06:00:00.000000+00:00",
+  "cancel_reason": "客户订单取消，整批复检前退回",
+  "groups": ["...原成员关系与各组确认时检测快照保留不变..."]
+}
+```
+
+撤销后组 1、2 的占用释放，可与其他安全组重新编批；旧批次与新批次在批次列表中
+同时可查：
+
+```bash
+# 组 1（安全）与组 3 重新建批 -> 201
+curl -s -X POST http://localhost:8000/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"group_ids":[1,3]}'
+
+curl -s http://localhost:8000/batches
+# 批次 1 仍保留（cancelled: true，group_ids [1,2]），批次 2 正常（group_ids [1,3]）
+```
+
+拒绝撤销的情形（不写撤销记录、**不释放任何成员**）：
+
+```bash
+# 批次不存在 -> 404
+curl -s -X POST http://localhost:8000/batches/999/cancel \
+  -H 'Content-Type: application/json' -d '{"reason":"x"}'
+# {"detail":"批次 999 不存在"}
+
+# 已发运 -> 409（撤销先于发运提交则相反：发运被拒绝，撤销生效）
+curl -s -X POST http://localhost:8000/batches/1/cancel \
+  -H 'Content-Type: application/json' -d '{"reason":"x"}'
+# {"detail":"批次 1 已发运（发运时间 2026-10-06T04:00:00.000000+00:00），不可撤销"}
+
+# 已撤销 -> 409，首次撤销时间与原因不改写
+curl -s -X POST http://localhost:8000/batches/1/cancel \
+  -H 'Content-Type: application/json' -d '{"reason":"另一个原因"}'
+# {"detail":"批次 1 已撤销（撤销时间 2026-10-07T06:00:00.000000+00:00），不可重复撤销"}
+
+# 原因为空 -> 422
+curl -s -X POST http://localhost:8000/batches/1/cancel \
+  -H 'Content-Type: application/json' -d '{"reason":""}'
+```
+
+撤销与发运、建批都走同一写路径（写锁 + `BEGIN IMMEDIATE`），并发时以**提交先后**
+决胜：撤销先提交则发运 `409` 拒绝、撤销生效；发运先提交则撤销 `409` 拒绝、发运
+事实保留。建批与撤销交错时，同一组不可能同时归属两个未撤销批次
+（`active_batch_groups.group_id` 主键兜底），冲突的建批整体回滚，不留部分成员、
+不产生半成品批次；`batch_groups` 历史归属表保留每一批的原始成员关系，不受撤销
+影响。撤销记录（`cancellations`）由数据库触发器禁止 UPDATE/DELETE，撤销本身
+不可撤销——需要重新交付时只能登记新批次。
+
 ## 项目结构
 
 ```
 app/
-  main.py       # FastAPI 路由：录入 / 复测 / 隔离 / 预选 / 确认 / 快照与阻断查询 / 批次登记、发运与查询
-  db.py         # 每线程 SQLite 连接（WAL）、schema、不可改写触发器、写锁
+  main.py       # FastAPI 路由：录入 / 复测 / 隔离 / 预选 / 确认 / 快照与阻断查询 / 批次登记、发运、撤销与查询
+  db.py         # 每线程 SQLite 连接（WAL）、schema 与旧库迁移、不可改写触发器、写锁
   selection.py  # 成组预选算法（穷举组合，最多 C(12,6)=924 种）
-  schemas.py    # Pydantic 请求模型（串联节数 3~6、隔离原因、批次 2~4 组等校验）
+  schemas.py    # Pydantic 请求模型（串联节数 3~6、隔离/撤销原因、批次 2~4 组等校验）
 tests/test_api.py
 Dockerfile / docker-compose.yml
 ```

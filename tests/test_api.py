@@ -783,7 +783,9 @@ def _assert_coherent_batch(b):
     blocked_gids = {g["group_id"] for g in b["groups"] if g["blocked"]}
     detail_gids = {x["group_id"] for x in b["blocked_groups"]}
     assert blocked_gids == detail_gids
-    assert b["deliverable"] == (not blocked_gids)
+    # 撤销批次同样不可交付；撤销与发运互斥，不可能同时成立
+    assert b["deliverable"] == (not blocked_gids and not b["cancelled"])
+    assert not (b["cancelled"] and b["shipped"])
     for g in b["groups"]:
         assert len(g["cells"]) == g["series_count"]
 
@@ -1430,4 +1432,487 @@ def test_get_batch_shipment_reads_one_committed_snapshot(client):
         # 发运前的快照里不可能看到发运后才提交的隔离
         assert b["deliverable"] is True
         assert b["blocked_groups"] == []
+
+
+# ---------- 批次撤销 ----------
+
+def _cancel(client, batch_id, reason="客户订单取消，整批复检前退回"):
+    return client.post(f"/batches/{batch_id}/cancel", json={"reason": reason})
+
+
+def _seed_four_groups(client):
+    """12 节 LFP -> 4 个 3 节组，返回组号列表。"""
+    _seed_twelve(client)
+    return [
+        _make_group(client, ["C001", "C002", "C003"]),
+        _make_group(client, ["C004", "C005", "C006"]),
+        _make_group(client, ["C007", "C008", "C009"]),
+        _make_group(client, ["C010", "C011", "C012"]),
+    ]
+
+
+def test_cancel_unshipped_batch_success(client):
+    gids = _seed_four_groups(client)
+    bid = client.post("/batches", json={"group_ids": gids[:2]}).json()["batch_id"]
+    before = client.get(f"/batches/{bid}").json()
+
+    r = _cancel(client, bid)
+    assert r.status_code == 201, r.text
+    b = r.json()
+    assert b["cancelled"] is True
+    assert b["cancelled_at"]
+    assert b["cancel_reason"] == "客户订单取消，整批复检前退回"
+    assert b["batch_id"] == bid
+    assert b["deliverable"] is False
+    assert b["shipped"] is False
+    assert b["shipped_at"] is None
+    assert b["trace_required"] is False
+
+    # 原批次、成员关系与各组检测快照全部保留
+    assert b["group_ids"] == before["group_ids"]
+    assert [g["cells"] for g in b["groups"]] == [g["cells"] for g in before["groups"]]
+
+    # 列表与按号查询口径一致，撤销时间与原因不可改写
+    one = client.get(f"/batches/{bid}").json()
+    assert one == b
+    lst = client.get("/batches").json()
+    assert lst["count"] == 1
+    assert lst["batches"][0] == b
+
+
+def test_cancel_releases_groups_for_rebatching(client):
+    gids = _seed_four_groups(client)
+    bid = client.post("/batches", json={"group_ids": gids[:2]}).json()["batch_id"]
+    assert _cancel(client, bid).status_code == 201
+
+    # 撤销后原成员组可与其他安全组重新编批
+    r = client.post("/batches", json={"group_ids": [gids[0], gids[2]]})
+    assert r.status_code == 201, r.text
+    new = r.json()
+    assert new["batch_id"] == bid + 1
+    assert new["group_ids"] == [gids[0], gids[2]]
+    assert new["cancelled"] is False
+    assert new["deliverable"] is True
+
+    # 两个批次同时可查；旧批次保留撤销状态，新批次正常
+    batches = {b["batch_id"]: b for b in client.get("/batches").json()["batches"]}
+    assert batches[bid]["cancelled"] is True
+    assert batches[bid]["group_ids"] == gids[:2]
+    assert batches[new["batch_id"]]["cancelled"] is False
+    # 同一组不能同时归属两个未撤销批次：g1 现在只属于新批次
+    assert _assert_only_active_batch(client, gids[0]) == new["batch_id"]
+
+
+def _assert_only_active_batch(client, group_id):
+    """active_batch_groups 中一个组最多出现一次，返回其当前归属批次。"""
+    import sqlite3
+    path = os.environ["DB_PATH"]
+    conn = sqlite3.connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT batch_id FROM active_batch_groups WHERE group_id = ?",
+            (group_id,)).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    return rows[0][0]
+
+
+def test_cancel_missing_batch_404(client):
+    r = _cancel(client, 999)
+    assert r.status_code == 404
+    assert "999" in r.json()["detail"]
+
+
+def test_repeat_cancel_rejected(client):
+    bid, _ = _make_batch(client)
+    first = _cancel(client, bid, "首次撤销原因")
+    assert first.status_code == 201
+    again = _cancel(client, bid, "另一个原因")
+    assert again.status_code == 409
+    assert "已撤销" in again.json()["detail"]
+    # 不改写首次撤销记录
+    b = client.get(f"/batches/{bid}").json()
+    assert b["cancelled_at"] == first.json()["cancelled_at"]
+    assert b["cancel_reason"] == "首次撤销原因"
+
+
+def test_cancel_shipped_batch_rejected(client):
+    bid, gids = _make_batch(client)
+    ship = client.post(f"/batches/{bid}/ship")
+    assert ship.status_code == 201
+    r = _cancel(client, bid)
+    assert r.status_code == 409
+    assert "已发运" in r.json()["detail"]
+    b = client.get(f"/batches/{bid}").json()
+    assert b["cancelled"] is False
+    assert b["cancelled_at"] is None
+    assert b["cancel_reason"] is None
+    assert b["shipped"] is True
+    # 发运记录与原成员关系保留，组未被释放
+    assert b["group_ids"] == gids
+    assert _assert_only_active_batch(client, gids[0]) == bid
+
+
+def test_cancel_empty_reason_422(client):
+    bid, _ = _make_batch(client)
+    r = client.post(f"/batches/{bid}/cancel", json={"reason": ""})
+    assert r.status_code == 422
+    r = client.post(f"/batches/{bid}/cancel", json={})
+    assert r.status_code == 422
+    # 校验失败不影响批次
+    b = client.get(f"/batches/{bid}").json()
+    assert b["cancelled"] is False
+    assert b["deliverable"] is True
+
+
+def test_cancelled_batch_not_deliverable_not_shippable(client):
+    bid, gids = _make_batch(client)
+    assert _cancel(client, bid).status_code == 201
+    b = client.get(f"/batches/{bid}").json()
+    assert b["cancelled"] is True
+    assert b["deliverable"] is False
+    # 撤销批次不可发运
+    r = client.post(f"/batches/{bid}/ship")
+    assert r.status_code == 409
+    assert "已撤销" in r.json()["detail"]
+    assert client.get(f"/batches/{bid}").json()["shipped"] is False
+
+
+def test_isolated_group_still_rejected_after_its_batch_cancelled(client):
+    """组所属批次撤销后，组内已隔离电芯仍按原规则拒绝重新编批。"""
+    gids = _seed_four_groups(client)
+    bid = client.post("/batches", json={"group_ids": gids[:2]}).json()["batch_id"]
+    # 建批后隔离 g2（含 C005），再撤销批次：占用释放，但隔离不解除
+    assert isolate(client, "C005", "巡检发现鼓包").status_code == 201
+    assert _cancel(client, bid).status_code == 201
+
+    # 安全的 g1 可以复用；含隔离电芯的 g2 仍整批拒绝
+    r = client.post("/batches", json={"group_ids": [gids[1], gids[2]]})
+    assert r.status_code == 409
+    assert str(gids[1]) in r.json()["detail"]
+    # 整批拒绝：g3 不留部分归属
+    assert client.get("/batches").json()["count"] == 1
+    r = client.post("/batches", json={"group_ids": [gids[0], gids[2]]})
+    assert r.status_code == 201
+    assert r.json()["group_ids"] == [gids[0], gids[2]]
+
+
+def test_cancel_blocked_unshipped_batch_releases_safe_groups(client):
+    """未发运批次被隔离阻断时仍可撤销；安全成员可重新编批，隔离组继续拒绝。"""
+    gids = _seed_four_groups(client)
+    bid = client.post("/batches", json={"group_ids": gids[:2]}).json()["batch_id"]
+    assert isolate(client, "C005", "巡检发现鼓包").status_code == 201
+    before = client.get(f"/batches/{bid}").json()
+    assert before["deliverable"] is False
+
+    r = _cancel(client, bid, "阻断批次退回重排")
+    assert r.status_code == 201, r.text
+    b = r.json()
+    assert b["cancelled"] is True
+    # 隔离追溯信息仍可在撤销批次上查到
+    assert [x["group_id"] for x in b["blocked_groups"]] == [gids[1]]
+
+    # g1 安全可复用；g2 含隔离电芯仍拒绝
+    ok = client.post("/batches", json={"group_ids": [gids[0], gids[2]]})
+    assert ok.status_code == 201
+    bad = client.post("/batches", json={"group_ids": [gids[1], gids[3]]})
+    assert bad.status_code == 409
+    assert str(gids[1]) in bad.json()["detail"]
+
+
+def test_cancellation_record_immutable_triggers(client):
+    bid, _ = _make_batch(client)
+    assert _cancel(client, bid).status_code == 201
+    import sqlite3
+    from app import db
+    conn = db.get_conn()
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "UPDATE cancellations SET reason = 'x' WHERE batch_id = ?", (bid,))
+    conn.rollback()
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("DELETE FROM cancellations WHERE batch_id = ?", (bid,))
+    conn.rollback()
+    # 触发器拦截后原记录保持不变
+    b = client.get(f"/batches/{bid}").json()
+    assert b["cancelled"] is True
+    assert b["cancel_reason"] == "客户订单取消，整批复检前退回"
+    # batch_groups 历史成员关系同样不可改写
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("DELETE FROM batch_groups WHERE batch_id = ?", (bid,))
+    conn.rollback()
+
+
+def test_uncommitted_cancel_invisible_rollback_leaves_everything(client):
+    """撤销事务未提交时对外不可见；回滚则不写撤销记录、不释放占用。"""
+    import sqlite3
+    gids = _seed_four_groups(client)
+    bid = client.post("/batches", json={"group_ids": gids[:2]}).json()["batch_id"]
+    from app import db
+    conn = db.get_conn()
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO cancellations (batch_id, reason, cancelled_at)"
+        " VALUES (?, '手工挂起撤销', '2026-10-07T00:00:00+00:00')", (bid,))
+    conn.execute(
+        "DELETE FROM active_batch_groups WHERE batch_id = ?", (bid,))
+    # 未提交：批次查询（独立连接）仍显示未撤销、可交付
+    b = client.get(f"/batches/{bid}").json()
+    assert b["cancelled"] is False
+    assert b["deliverable"] is True
+    # 未提交的 DELETE 对独立连接不可见：占用仍在
+    ro = sqlite3.connect(os.environ["DB_PATH"])
+    try:
+        assert ro.execute(
+            "SELECT COUNT(*) FROM active_batch_groups WHERE batch_id = ?",
+            (bid,)).fetchone()[0] == 2
+    finally:
+        ro.close()
+    # 回滚后毫无痕迹：撤销记录不存在，批次仍可正常发运
+    conn.rollback()
+    assert client.get(f"/batches/{bid}").json()["cancelled"] is False
+    assert client.post(f"/batches/{bid}/ship").status_code == 201
+    # 已发运后撤销被拒绝
+    assert _cancel(client, bid).status_code == 409
+
+
+def test_cancel_and_ship_race_commit_order_decides(client):
+    """撤销与发运并发：以提交先后决定，二者绝不同时生效，查询不见半成品。"""
+    bid, gids = _make_batch(client)
+    from app.main import app
+    results = {}
+    broken = []
+
+    def do_cancel():
+        with TestClient(app) as c:
+            results["cancel"] = _cancel(c, bid, "并发撤销").status_code
+
+    def do_ship():
+        with TestClient(app) as c:
+            results["ship"] = c.post(f"/batches/{bid}/ship").status_code
+            for _ in range(10):
+                b = c.get(f"/batches/{bid}").json()
+                try:
+                    _assert_coherent_batch(b)
+                    _assert_coherent_shipment_state(b)
+                    # 撤销与发运互斥：不允许同时成立
+                    assert not (b["cancelled"] and b["shipped"])
+                except AssertionError:
+                    broken.append(b)
+
+    threads = [threading.Thread(target=do_cancel), threading.Thread(target=do_ship)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not broken
+    assert {results["cancel"], results["ship"]} == {201, 409}
+    b = client.get(f"/batches/{bid}").json()
+    if results["cancel"] == 201 and results["ship"] == 409:
+        # 撤销先提交：发运被拒绝，占用已释放，两个成员组可重新编批
+        r = client.post("/batches", json={"group_ids": list(gids)})
+        assert r.status_code == 201
+        assert r.json()["group_ids"] == list(gids)
+    else:
+        # 发运先提交：撤销被拒绝，发运记录保留，占用未释放
+        assert results["ship"] == 201 and results["cancel"] == 409
+        assert b["shipped"] is True and b["cancelled"] is False
+        assert _assert_only_active_batch(client, gids[0]) == bid
+
+
+def test_cancel_then_create_batch_reuse(client):
+    """撤销后新建批次复用同一组；旧批次与新批次历史同时可查。"""
+    gids = _seed_four_groups(client)
+    old = client.post("/batches", json={"group_ids": gids[:2]}).json()["batch_id"]
+    assert _cancel(client, old, "退回重排").status_code == 201
+    new = client.post("/batches", json={"group_ids": [gids[0], gids[2]]})
+    assert new.status_code == 201
+    new_bid = new.json()["batch_id"]
+    # 占用表中 g1 只属于新批次；历史表 batch_groups 同时保留两条归属
+    import sqlite3
+    path = os.environ["DB_PATH"]
+    conn = sqlite3.connect(path)
+    try:
+        active = conn.execute(
+            "SELECT batch_id FROM active_batch_groups WHERE group_id = ? ORDER BY batch_id",
+            (gids[0],)).fetchall()
+        history = conn.execute(
+            "SELECT batch_id FROM batch_groups WHERE group_id = ? ORDER BY batch_id",
+            (gids[0],)).fetchall()
+    finally:
+        conn.close()
+    assert [r[0] for r in active] == [new_bid]
+    assert [r[0] for r in history] == [old, new_bid]
+
+
+def test_create_and_cancel_interleave_no_double_active_ownership(client):
+    """建批与撤销交错：同一组不得同时归属两个未撤销批次，冲突操作不留部分生效。"""
+    gids = _seed_four_groups(client)
+    from app.main import app
+    bid = client.post("/batches", json={"group_ids": gids[:2]}).json()["batch_id"]
+    results = {}
+    broken = []
+
+    def do_cancel():
+        with TestClient(app) as c:
+            results["cancel"] = _cancel(c, bid, "并发撤销").status_code
+
+    def do_create():
+        with TestClient(app) as c:
+            # 与撤销竞争复用 g1（g3 是双方共用以外的安全组）
+            results["create"] = c.post(
+                "/batches", json={"group_ids": [gids[0], gids[2]]}).status_code
+            for _ in range(10):
+                for b in c.get("/batches").json()["batches"]:
+                    try:
+                        _assert_coherent_batch(b)
+                        assert not (b["cancelled"] and b["shipped"])
+                    except AssertionError:
+                        broken.append(b)
+
+    threads = [threading.Thread(target=do_cancel), threading.Thread(target=do_create)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not broken
+    # 撤销最终都会提交成功（建批不会发运）；建批结果取决于提交先后
+    assert results["cancel"] == 201
+    import sqlite3
+    path = os.environ["DB_PATH"]
+    conn = sqlite3.connect(path)
+    try:
+        active_g1 = conn.execute(
+            "SELECT batch_id FROM active_batch_groups WHERE group_id = ?",
+            (gids[0],)).fetchall()
+        active_g3 = conn.execute(
+            "SELECT batch_id FROM active_batch_groups WHERE group_id = ?",
+            (gids[2],)).fetchall()
+        partial = conn.execute(
+            "SELECT batch_id FROM batch_groups GROUP BY batch_id"
+            " HAVING COUNT(*) != 2").fetchall()
+    finally:
+        conn.close()
+    # 同一时刻 g1 最多归属一个未撤销批次；所有历史批次成员都是完整的 2 个组
+    assert len(active_g1) <= 1
+    assert partial == []
+    if results["create"] == 201:
+        # 建批先提交：g1 曾被旧批占用，冲突窗口内整批拒绝逻辑之外建批成功；
+        # 随后撤销提交（撤销针对旧批，不影响新批）-> g1/g3 留在新批占用中
+        assert [r[0] for r in active_g1] == [2]
+        assert [r[0] for r in active_g3] == [2]
+    else:
+        # 撤销先提交释放旧批：建批与撤销竞争，建批整批 409；
+        # 随后没有其他写操作时占用表为空（若撤销在建批 409 前已提交亦同）
+        assert results["create"] == 409
+        assert active_g1 == []
+        assert active_g3 == []
+    batches = {b["batch_id"]: b for b in client.get("/batches").json()["batches"]}
+    assert batches[bid]["cancelled"] is True
+    # 终态下 g2（撤销释放）与从未入批的 g4 都是安全空闲组，可再次建批
+    follow = client.post("/batches", json={"group_ids": [gids[1], gids[3]]})
+    assert follow.status_code == 201
+
+
+def test_legacy_database_migrates_occupancy_and_supports_cancel(tmp_path, monkeypatch):
+    """旧库（旧唯一索引、无撤销/占用表）启动时迁移：回填占用，之后可正常撤销复用。"""
+    import sqlite3
+    path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(path)
+    legacy.executescript(
+        """
+        CREATE TABLE cells (
+            cell_id TEXT PRIMARY KEY, chemistry TEXT NOT NULL, capacity REAL NOT NULL,
+            resistance REAL NOT NULL, test_version TEXT NOT NULL,
+            occupied INTEGER NOT NULL DEFAULT 0, group_id INTEGER);
+        CREATE TABLE groups (
+            group_id INTEGER PRIMARY KEY AUTOINCREMENT, chemistry TEXT NOT NULL,
+            series_count INTEGER NOT NULL, limited_capacity REAL NOT NULL,
+            created_at TEXT NOT NULL);
+        CREATE TABLE group_cells (
+            group_id INTEGER NOT NULL, cell_id TEXT NOT NULL, capacity REAL NOT NULL,
+            resistance REAL NOT NULL, test_version TEXT NOT NULL,
+            PRIMARY KEY (group_id, cell_id));
+        CREATE TABLE isolations (
+            cell_id TEXT PRIMARY KEY, reason TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE batches (
+            batch_id INTEGER PRIMARY KEY AUTOINCREMENT, chemistry TEXT NOT NULL,
+            created_at TEXT NOT NULL);
+        CREATE TABLE batch_groups (
+            batch_id INTEGER NOT NULL, group_id INTEGER NOT NULL,
+            PRIMARY KEY (batch_id, group_id));
+        CREATE UNIQUE INDEX idx_batch_groups_group ON batch_groups(group_id);
+        CREATE TABLE shipments (batch_id INTEGER PRIMARY KEY, shipped_at TEXT NOT NULL);
+        """
+    )
+    legacy.execute("INSERT INTO groups (group_id, chemistry, series_count,"
+                   " limited_capacity, created_at) VALUES"
+                   " (1, 'LFP', 3, 98.0, '2026-10-05T00:00:00+00:00'),"
+                   " (2, 'LFP', 3, 95.5, '2026-10-05T00:00:00+00:00')")
+    legacy.execute("INSERT INTO batches (batch_id, chemistry, created_at)"
+                   " VALUES (1, 'LFP', '2026-10-06T00:00:00+00:00')")
+    legacy.executemany(
+        "INSERT INTO batch_groups (batch_id, group_id) VALUES (?, ?)",
+        [(1, 1), (1, 2)])
+    legacy.execute("INSERT INTO shipments (batch_id, shipped_at)"
+                   " VALUES (1, '2026-10-06T01:00:00+00:00')")
+    legacy.commit()
+    legacy.close()
+
+    monkeypatch.setenv("DB_PATH", str(path))
+    from app import db
+    db.reset()
+    from app.main import app
+    with TestClient(app) as c:
+        # 历史批次与发运事实继续可查，原字段口径不变
+        b = c.get("/batches/1").json()
+        assert b["group_ids"] == [1, 2]
+        assert b["shipped"] is True
+        assert b["shipped_at"] == "2026-10-06T01:00:00+00:00"
+        assert b["cancelled"] is False
+        assert b["cancel_reason"] is None
+        # 已发运 -> 撤销拒绝
+        r = c.post("/batches/1/cancel", json={"reason": "旧库撤销尝试"})
+        assert r.status_code == 409
+        # 旧唯一索引已迁移：batch_groups 允许同组的历史归属重复（撤销后重建批需要）
+        import sqlite3 as sq
+        conn = sq.connect(str(path))
+        try:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM active_batch_groups WHERE batch_id = 1").fetchone()[0]
+            assert n == 2
+            idx = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'idx_batch_groups_group'").fetchone()
+            assert idx is None
+        finally:
+            conn.close()
+    db.reset()
+
+
+def test_restart_does_not_reclaim_cancelled_groups(tmp_path, monkeypatch):
+    """重启后不会把已撤销批次释放的组重新占用（回填只在旧库升级时发生一次）。"""
+    path = tmp_path / "restart.db"
+    monkeypatch.setenv("DB_PATH", str(path))
+    from app import db
+    db.reset()
+    from app.main import app
+    with TestClient(app) as c:
+        gids = _seed_four_groups(c)
+        bid = c.post("/batches", json={"group_ids": gids[:2]}).json()["batch_id"]
+        assert _cancel(c, bid, "退回重排").status_code == 201
+        assert c.post("/batches", json={"group_ids": [gids[0], gids[2]]}).status_code == 201
+    # 模拟进程重启：丢弃全部连接与初始化状态，用同一库文件重新初始化
+    db.reset()
+    with TestClient(app) as c:
+        g1 = gids[0]
+        # g1 仍只属于撤销后新建的批次 2，旧批次 1 保持撤销态
+        assert _assert_only_active_batch(c, g1) == 2
+        batches = {b["batch_id"]: b for b in c.get("/batches").json()["batches"]}
+        assert batches[1]["cancelled"] is True
+        assert batches[2]["cancelled"] is False
+        assert batches[2]["group_ids"] == [gids[0], gids[2]]
+    db.reset()
 
